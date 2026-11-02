@@ -357,18 +357,23 @@ def whisper_segments(url, info, tmp):
               (l.split(",") for l in Path(f"{tmp}/parts.csv").read_text().split())}
     provider = stt_provider()
     key = provider_key(provider) if provider in PROVIDERS else None
-    segs, used = [], set()
     parts = sorted(Path(tmp).glob("part_*.ogg"))
-    for i, part in enumerate(parts):
-        offset = starts[part.name]
-        log(f"  transcribing part {i + 1}/{len(parts)} with {provider}")
-        t0 = time.time()
-        res, model = (cloudflare_transcribe(part, prompt) if provider == "cloudflare"
-                      else groq_transcribe(part, prompt, key, provider))
+    log(f"  transcribing {len(parts)} part(s) in parallel with {provider}")
+    t0 = time.time()
+
+    def one(part):
+        return (cloudflare_transcribe(part, prompt) if provider == "cloudflare"
+                else groq_transcribe(part, prompt, key, provider))
+
+    # All chunks at once: a long talk takes about as long as its slowest 20-min chunk.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(one, parts))
+    segs, used = [], set()
+    for part, (res, model) in zip(parts, results):
         used.add(model)
-        log(f"    {len(res.get('segments', []))} segments via {model} in {time.time() - t0:.0f}s")
-        for s in res.get("segments", []):
-            segs.append((offset + s["start"], s["text"].strip()))
+        segs += [(starts[part.name] + s["start"], s["text"].strip()) for s in res.get("segments", [])]
+    log(f"    {len(segs)} segments via {'+'.join(sorted(used))} in {time.time() - t0:.0f}s")
     return segs, f"{provider}:" + "+".join(sorted(used))
 
 
