@@ -74,7 +74,9 @@ ytkb add "https://youtu.be/VIDEO_ID"            # ingest (no args: clipboard)
 ytkb add "https://www.youtube.com/@Channel" -n 10       # latest 10 videos
 ytkb add "https://www.youtube.com/playlist?list=..."    # a whole playlist
 ytkb add "https://www.youtube.com/feed/history"         # recent history, filtered
-ytkb ask "how are people doing evals for coding agents?"
+ytkb ask "how are people doing evals for coding agents?"   # one-shot answer
+ytkb chat "how are people doing evals for coding agents?"  # conversation: follow-ups keep context
+ytkb pick                                        # choose queued videos with ↑↓ / space / enter
 ytkb search '"autonomy slider" OR leash'         # SQLite FTS5 syntax
 ytkb show VIDEO_ID --at 1243                     # transcript around 20:43
 ytkb show VIDEO_ID --summary
@@ -115,6 +117,7 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 | Variable | Default |
 | --- | --- |
 | `YTKB_GROQ_API_KEY` | falls back to `GROQ_API_KEY` |
+| `YTKB_FREE` | unset; `1` = use YouTube auto-captions instead of Whisper (free, less accurate) |
 | `YTKB_BROWSER` | none; set to use your YouTube login for history / Watch Later |
 | `YTKB_TOPICS` | AI-assisted engineering, software practice, business/startups |
 | `YTKB_DB` | `~/.local/share/ytkb/ytkb.db` |
