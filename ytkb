@@ -79,6 +79,14 @@ def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    cols = {r["name"] for r in con.execute("pragma table_info(queue)")}
+    if "pos" not in cols:
+        # Imports list newest-first; YouTube's history feed has no watch dates, so the
+        # import time + position in the list is what orders the queue.
+        with con:
+            con.execute("alter table queue add column imported_at real default 0")
+            con.execute("alter table queue add column pos integer")
+            con.execute("update queue set pos = rowid")
     return con
 
 
@@ -421,7 +429,7 @@ def expand(url, limit=None):
 def add_history(con, url, a):
     """History is mostly off-topic: queue it, let Claude pre-select what's relevant,
     then let the user adjust the selection (when interactive) and ingest it."""
-    enqueue(con, expand(url, a.n or 200))
+    enqueue(con, expand(url, a.n))  # all of it unless -n; listing is free, only picks cost
     cmd_triage(con, a)
     if sys.stdin.isatty() and sys.stdout.isatty():
         cmd_pick(con, a)
@@ -482,10 +490,12 @@ def pick(items, preselected):
 def cmd_pick(con, a):
     rows = con.execute("select id, title, channel, watched_at, status from queue "
                        "where status in ('new','relevant','skip') "
-                       "order by watched_at desc, rowid desc").fetchall()
+                       f"order by {QUEUE_ORDER}").fetchall()
     if not rows:
         sys.exit("queue is empty; add your history first (ytkb add https://www.youtube.com/feed/history)")
-    items = [(r["id"], f"{(r['watched_at'] or '')[:10]:10}  {r['title']} — {r['channel'] or ''}")
+    items = [(r["id"], "  ".join(x for x in (
+                  (r["watched_at"] or "")[:10], r["title"] or r["id"],
+                  f"— {r['channel']}" if r["channel"] else "") if x))
              for r in rows]
     chosen = pick(items, [r["id"] for r in rows if r["status"] == "relevant"])
     if chosen is None:
@@ -502,13 +512,18 @@ def cmd_pick(con, a):
 
 # ---------------------------------------------------------------- history
 
+# Newest first: latest import first, then each import's own (newest-first) order.
+QUEUE_ORDER = "imported_at desc, pos asc"
+
+
 def enqueue(con, items):
-    n = 0
+    n, now = 0, time.time()
     with con:
-        for it in items:
+        for pos, it in enumerate(items):
             n += con.execute(
-                "insert or ignore into queue(id,title,channel,watched_at) values(?,?,?,?)",
-                (it["id"], it["title"], it.get("channel"), it.get("watched_at")),
+                "insert or ignore into queue(id,title,channel,watched_at,imported_at,pos) "
+                "values(?,?,?,?,?,?)",
+                (it["id"], it["title"], it.get("channel"), it.get("watched_at"), now, pos),
             ).rowcount
     log(f"queued {n} new videos ({len(items) - n} already known)")
 
@@ -564,7 +579,7 @@ def cmd_triage(con, a):
 
 
 def cmd_process(con, a):
-    rows = con.execute("select id from queue where status='relevant' order by watched_at desc "
+    rows = con.execute(f"select id from queue where status='relevant' order by {QUEUE_ORDER} "
                        + (f"limit {int(a.n)}" if a.n else "")).fetchall()
     log(f"processing {len(rows)} videos")
     for i, r in enumerate(rows):
@@ -751,8 +766,7 @@ def main():
     s = cmd("add", "ingest videos, playlists, channels or your history (no args: clipboard)")
     s.add_argument("urls", nargs="*", help="video, playlist, channel, or "
                    "https://www.youtube.com/feed/history (needs YTKB_BROWSER)")
-    s.add_argument("-n", type=int, help="playlist/channel/history: at most N videos "
-                   "(history default 200)")
+    s.add_argument("-n", type=int, help="playlist/channel/history: only the N most recent")
     s.add_argument("--no-summary", action="store_true", help="skip the Claude summary")
     s = cmd("import-takeout", "queue your watch history from a Google Takeout JSON")
     s.add_argument("file", help="watch-history.json")

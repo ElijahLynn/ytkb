@@ -92,7 +92,7 @@ signed in to YouTube:
 
 ```bash
 echo 'YTKB_BROWSER=brave' >> ~/.env    # or firefox, chrome, chromium, ...
-ytkb add "https://www.youtube.com/feed/history" -n 300
+ytkb add "https://www.youtube.com/feed/history"   # -n 300 for just the latest
 ```
 
 History is mostly off-topic, so it's queued, Claude keeps the videos matching
