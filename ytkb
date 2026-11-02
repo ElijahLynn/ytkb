@@ -237,7 +237,7 @@ def groq_transcribe(path, prompt, key):
              "https://api.groq.com/openai/v1/audio/transcriptions",
              "-F", f"file=@{path}",
              "-F", f"model={model}", "-F", "response_format=verbose_json",
-             "--form-string", f"prompt={prompt}", "-w", "\n%{http_code}"],
+             *(["--form-string", f"prompt={prompt}"] if prompt else []), "-w", "\n%{http_code}"],
             input=f'header = "Authorization: Bearer {key}"\n', capture_output=True, text=True,
         )
         body, _, code = r.stdout.rpartition("\n")
@@ -268,8 +268,10 @@ def cloudflare_transcribe(path, prompt):
     if not acct or not token:
         sys.exit("YTKB_STT=cloudflare needs YTKB_CF_ACCOUNT_ID and YTKB_CF_API_TOKEN (env or ~/.env)")
     body = Path(f"{path}.json")
-    body.write_text(json.dumps({"audio": base64.b64encode(Path(path).read_bytes()).decode(),
-                                "task": "transcribe", "initial_prompt": prompt}))
+    req = {"audio": base64.b64encode(Path(path).read_bytes()).decode(), "task": "transcribe"}
+    if prompt:
+        req["initial_prompt"] = prompt
+    body.write_text(json.dumps(req))
     for attempt in range(1, 7):
         # Token goes in via a stdin config so it never shows in `ps`.
         r = subprocess.run(
@@ -326,8 +328,10 @@ def whisper_segments(url, info, tmp):
         run(split + ["-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k",
                      f"{tmp}/part_%03d.ogg"])
     log(f"  split in {time.time() - t0:.1f}s")
-    # Proper nouns in the prompt measurably improve Whisper's spelling of them.
-    prompt = f"{info.get('title', '')} — {info.get('channel', '')}"[:800]
+    # No prompt by default: with the title as a prompt, Groq's large-v3 echoed it in place
+    # of ~30 s stretches of speech (lost 29% of a talk), and names came out right without it.
+    prompt = (f"{info.get('title', '')} — {info.get('channel', '')}"[:800]
+              if setting("YTKB_WHISPER_PROMPT") == "1" else "")
     starts = {Path(name).name: float(start) for name, start, _ in
               (l.split(",") for l in Path(f"{tmp}/parts.csv").read_text().split())}
     provider = stt_provider()
@@ -361,10 +365,19 @@ def summarize(info, transcript):
 
 # ---------------------------------------------------------------- ingest
 
-def ingest(con, url_or_id, with_summary=True):
+def forget(con, vid):
+    with con:
+        for table, col in (("videos", "id"), ("videos_fts", "id"), ("segments_fts", "video_id")):
+            con.execute(f"delete from {table} where {col}=?", (vid,))
+
+
+def ingest(con, url_or_id, with_summary=True, redo=False):
     vid = video_id(url_or_id)
     if not vid:
         raise ValueError(f"not a YouTube URL: {url_or_id}")
+    if redo and con.execute("select 1 from videos where id=?", (vid,)).fetchone():
+        log(f"~ {vid}: re-transcribing (--redo)")
+        forget(con, vid)
     if con.execute("select 1 from videos where id=?", (vid,)).fetchone():
         log(f"= {vid} already ingested; skipping")
         return vid
@@ -437,7 +450,7 @@ def cmd_add(con, a):
     for u in urls:
         try:
             if video_id(u):
-                ingest(con, u, not a.no_summary)
+                ingest(con, u, not a.no_summary, redo=a.redo)
             elif HISTORY_URL.search(u):
                 add_history(con, u, a)
             else:
@@ -856,6 +869,7 @@ def main():
                    "https://www.youtube.com/feed/history (needs YTKB_BROWSER)")
     s.add_argument("-n", type=int, help="playlist/channel/history: only the N most recent")
     s.add_argument("--no-summary", action="store_true", help="skip the Claude summary")
+    s.add_argument("--redo", action="store_true", help="re-transcribe videos already saved")
     s = cmd("import-takeout", "queue your watch history from a Google Takeout JSON")
     s.add_argument("file", help="watch-history.json")
     s = cmd("import-history", "queue recent history via yt-dlp + browser cookies")

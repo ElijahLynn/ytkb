@@ -27,8 +27,9 @@ transcript lines.
    accurate). Otherwise it downloads YouTube's small Opus audio track, splits
    it into 20-minute chunks without re-encoding, and transcribes them with
    Whisper on [Groq](https://console.groq.com) (`whisper-large-v3`, falling
-   back to `whisper-large-v3-turbo` when rate-limited). The video's title and
-   channel are passed as a prompt so names get spelled right.
+   back to `whisper-large-v3-turbo` when rate-limited), or on Cloudflare Workers AI
+   (`YTKB_STT=cloudflare`). No prompt is sent: with the title as a prompt,
+   large-v3 sometimes echoed it in place of ~30 s of speech.
 2. **Summary.** Claude (via the [Claude Code](https://claude.com/claude-code)
    CLI, so it runs on your Claude subscription) writes a summary and a list of
    the concrete techniques and claims.
