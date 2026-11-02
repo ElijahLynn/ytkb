@@ -71,6 +71,9 @@ ln -s ~/projects/ytkb/skills/ytkb ~/.claude/skills/ytkb
 
 ```bash
 ytkb add "https://youtu.be/VIDEO_ID"            # ingest (no args: clipboard)
+ytkb add "https://www.youtube.com/@Channel" -n 10       # latest 10 videos
+ytkb add "https://www.youtube.com/playlist?list=..."    # a whole playlist
+ytkb add "https://www.youtube.com/feed/history"         # recent history, filtered
 ytkb ask "how are people doing evals for coding agents?"
 ytkb search '"autonomy slider" OR leash'         # SQLite FTS5 syntax
 ytkb show VIDEO_ID --at 1243                     # transcript around 20:43
@@ -78,7 +81,22 @@ ytkb show VIDEO_ID --summary
 ytkb list | ytkb stats
 ```
 
-### Your whole watch history
+### Your watch history
+
+Pasting [https://www.youtube.com/feed/history](https://www.youtube.com/feed/history)
+(or Watch Later / Liked videos) needs your YouTube login. `ytkb` doesn't ask
+for a password; it has yt-dlp reuse the login cookies of a browser where you're
+signed in to YouTube:
+
+```bash
+echo 'YTKB_BROWSER=brave' >> ~/.env    # or firefox, chrome, chromium, ...
+ytkb add "https://www.youtube.com/feed/history" -n 300
+```
+
+History is mostly off-topic, so it's queued, Claude keeps the videos matching
+`YTKB_TOPICS` (by title), and only those are transcribed.
+
+For your **entire** history (the feed only reaches back so far):
 
 1. Export it from [Google Takeout](https://takeout.google.com): deselect all,
    pick **YouTube and YouTube Music**, include only **history**, format **JSON**.
@@ -90,9 +108,6 @@ ytkb triage                 # topics: YTKB_TOPICS
 ytkb process -n 20          # newest first; re-run to continue
 ```
 
-For later top-ups, `ytkb import-history firefox -n 200` reads recent history
-via yt-dlp and your browser's YouTube cookies.
-
 ## Settings
 
 Environment variables, or lines in `~/.env` (values may be `op://` references):
@@ -100,6 +115,7 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 | Variable | Default |
 | --- | --- |
 | `YTKB_GROQ_API_KEY` | falls back to `GROQ_API_KEY` |
+| `YTKB_BROWSER` | none; set to use your YouTube login for history / Watch Later |
 | `YTKB_TOPICS` | AI-assisted engineering, software practice, business/startups |
 | `YTKB_DB` | `~/.local/share/ytkb/ytkb.db` |
 | `YTKB_GROQ_MODEL` / `YTKB_GROQ_FALLBACK` | `whisper-large-v3` / `whisper-large-v3-turbo` |

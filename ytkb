@@ -7,6 +7,8 @@ the moment something was said.
 
 examples:
   ytkb add "https://youtu.be/VIDEO_ID"         save one video
+  ytkb add "https://www.youtube.com/@Channel" -n 10   latest 10 from a channel
+  ytkb add "https://www.youtube.com/feed/history"     recent history, filtered
   ytkb ask "how are people doing evals for coding agents?"
   ytkb search '"autonomy slider" OR leash'
   ytkb show VIDEO_ID --at 1243                  context around 20:43
@@ -19,7 +21,8 @@ Whisper. In a Claude Code session the `ytkb` skill answers questions directly.
 
 settings (env or ~/.env; values may be op:// 1Password references):
   YTKB_GROQ_API_KEY   Groq key (falls back to GROQ_API_KEY)
-  YTKB_TOPICS         what `triage` keeps
+  YTKB_BROWSER        browser whose YouTube login to use for history/Watch Later
+  YTKB_TOPICS         what `triage` and history imports keep
   YTKB_DB             database path (default ~/.local/share/ytkb/ytkb.db)
 """
 
@@ -99,6 +102,17 @@ def video_id(s):
 def ts(seconds):
     s = int(seconds)
     return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def setting(name, default=None):
+    if os.environ.get(name):
+        return os.environ[name]
+    env = Path.home() / ".env"
+    for line in env.read_text().splitlines() if env.exists() else []:
+        m = re.match(rf"\s*(?:export\s+)?{name}\s*=\s*['\"]?([^'\"]+?)['\"]?\s*$", line)
+        if m:
+            return m.group(1)
+    return default
 
 
 _groq_key = None
@@ -343,9 +357,54 @@ def cmd_add(con, a):
             sys.exit("no URL given and no clipboard tool (wl-clipboard) found")
     for u in urls:
         try:
-            ingest(con, u, not a.no_summary)
+            if video_id(u):
+                ingest(con, u, not a.no_summary)
+            elif HISTORY_URL.search(u):
+                add_history(con, u, a)
+            else:
+                items = expand(u, a.n)
+                log(f"{len(items)} videos in {u}")
+                for i, it in enumerate(items):
+                    log(f"[{i + 1}/{len(items)}]")
+                    try:
+                        ingest(con, it["id"], not a.no_summary)
+                    except Exception as e:
+                        log(f"! {it['id']}: {e}")
         except Exception as e:
             log(f"! {u}: {e}")
+
+
+# Lists only your logged-in YouTube account can see.
+AUTH_URL = re.compile(r"/feed/|[?&]list=(WL|LL)\b|^:yt")
+HISTORY_URL = re.compile(r"/feed/history|^:ythistory")
+
+
+def expand(url, limit=None):
+    """Videos in a playlist, channel or feed URL (flat: ids + titles, no downloads)."""
+    if re.search(r"youtube\.com/(@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+)/?$", url):
+        url = url.rstrip("/") + "/videos"  # channel root lists tabs, not videos
+    cmd = ["yt-dlp", "--flat-playlist", "-J"]
+    if limit:
+        cmd += ["--playlist-end", str(limit)]
+    if AUTH_URL.search(url):
+        browser = setting("YTKB_BROWSER")
+        if not browser:
+            raise RuntimeError("this URL needs your YouTube login: set YTKB_BROWSER=brave "
+                               "(or firefox, chrome, ...) in ~/.env so ytkb can use that "
+                               "browser's YouTube cookies")
+        log(f"  reading your YouTube login from {browser}")
+        cmd += ["--cookies-from-browser", browser]
+    log(f"  listing {url}")
+    data = json.loads(run(cmd + [url]))
+    return [dict(id=e["id"], title=e.get("title"), channel=e.get("channel") or e.get("uploader"))
+            for e in data.get("entries") or [] if video_id(e.get("id") or "")]
+
+
+def add_history(con, url, a):
+    """History is mostly off-topic: queue it, let Claude triage, ingest what's relevant."""
+    enqueue(con, expand(url, a.n or 200))
+    cmd_triage(con, a)
+    cmd_process(con, argparse.Namespace(n=None, sleep=5, no_summary=a.no_summary))
 
 
 # ---------------------------------------------------------------- history
@@ -380,13 +439,8 @@ def cmd_import_takeout(con, a):
 
 
 def cmd_import_history(con, a):
-    cmd = ["yt-dlp", "--flat-playlist", "-J", "--cookies-from-browser", a.browser,
-           ":ythistory"]
-    if a.n:
-        cmd[1:1] = ["--playlist-end", str(a.n)]
-    data = json.loads(run(cmd))
-    enqueue(con, [dict(id=e["id"], title=e.get("title"), channel=e.get("channel"))
-                  for e in data.get("entries", []) if e.get("id")])
+    os.environ["YTKB_BROWSER"] = a.browser
+    enqueue(con, expand(":ythistory", a.n))
 
 
 def cmd_triage(con, a):
@@ -589,8 +643,11 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", metavar="COMMAND", title="commands")
     cmd = lambda name, help: sp.add_parser(name, help=help, description=help)
-    s = cmd("add", "ingest YouTube links (no args: read clipboard)")
-    s.add_argument("urls", nargs="*", help="video URLs or 11-char ids")
+    s = cmd("add", "ingest videos, playlists, channels or your history (no args: clipboard)")
+    s.add_argument("urls", nargs="*", help="video, playlist, channel, or "
+                   "https://www.youtube.com/feed/history (needs YTKB_BROWSER)")
+    s.add_argument("-n", type=int, help="playlist/channel/history: at most N videos "
+                   "(history default 200)")
     s.add_argument("--no-summary", action="store_true", help="skip the Claude summary")
     s = cmd("import-takeout", "queue your watch history from a Google Takeout JSON")
     s.add_argument("file", help="watch-history.json")
