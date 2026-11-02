@@ -21,7 +21,9 @@ transcripts: uploader-written captions when available (free), otherwise Groq
 Whisper. In a Claude Code session the `ytkb` skill answers questions directly.
 
 settings (env or ~/.env; values may be op:// 1Password references):
+  YTKB_STT            groq (default) or cloudflare (Workers AI whisper-large-v3-turbo)
   YTKB_GROQ_API_KEY   Groq key (falls back to GROQ_API_KEY)
+  YTKB_CF_ACCOUNT_ID, YTKB_CF_API_TOKEN   Cloudflare account + Workers AI token
   YTKB_FREE=1         always use --free (YouTube auto-captions instead of Whisper)
   YTKB_BROWSER        browser whose YouTube login to use for history/Watch Later
   YTKB_TOPICS         what `triage` and history imports keep
@@ -29,6 +31,7 @@ settings (env or ~/.env; values may be op:// 1Password references):
 """
 
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -136,32 +139,31 @@ def setting(name, default=None):
     return default
 
 
-_groq_key = None
+_secrets = {}
 
 
-def groq_key():
-    """YTKB_GROQ_API_KEY (ytkb's own key) wins over the shared GROQ_API_KEY.
-    Values may be 1Password references (op://vault/item/field), resolved via `op read`."""
-    global _groq_key
-    if _groq_key:
-        return _groq_key
-    env = Path.home() / ".env"
-    lines = env.read_text().splitlines() if env.exists() else []
-    for name in ("YTKB_GROQ_API_KEY", "GROQ_API_KEY"):
-        val = os.environ.get(name)
-        for line in lines if not val else []:
-            m = re.match(rf"\s*(?:export\s+)?{name}\s*=\s*['\"]?([^'\"]+?)['\"]?\s*$", line)
-            if m:
-                val = m.group(1)
+def secret(*names):
+    """First of `names` set in env or ~/.env. Values may be 1Password references
+    (op://vault/item/field), resolved once via `op read`."""
+    for name in names:
+        if name in _secrets:
+            return _secrets[name]
+        val = setting(name)
         if val:
             if val.startswith("op://"):
-                # Read with Elijah's desktop-app session, not a read-only service token
+                # Use the desktop-app session, not a read-only service-account token
                 # that may not see this vault.
                 env_ = {k: v for k, v in os.environ.items() if k != "OP_SERVICE_ACCOUNT_TOKEN"}
                 val = run(["op", "read", val], env=env_).strip()
-            _groq_key = val
+            _secrets[name] = val
             return val
-    sys.exit("YTKB_GROQ_API_KEY / GROQ_API_KEY not set (env or ~/.env)")
+    return None
+
+
+def groq_key():
+    """YTKB_GROQ_API_KEY (ytkb's own key) wins over the shared GROQ_API_KEY."""
+    return secret("YTKB_GROQ_API_KEY", "GROQ_API_KEY") or sys.exit(
+        "YTKB_GROQ_API_KEY / GROQ_API_KEY not set (env or ~/.env)")
 
 
 def claude(prompt, system, stdin=None, model=None):
@@ -256,6 +258,46 @@ def groq_transcribe(path, prompt, key):
         raise RuntimeError(f"groq {code}: {body[:300]} {r.stderr[:300]}")
 
 
+CF_MODEL = "@cf/openai/whisper-large-v3-turbo"
+
+
+def cloudflare_transcribe(path, prompt):
+    """Whisper large-v3-turbo on Cloudflare Workers AI. Returns (response, model)."""
+    acct = setting("YTKB_CF_ACCOUNT_ID") or setting("CLOUDFLARE_ACCOUNT_ID")
+    token = secret("YTKB_CF_API_TOKEN")
+    if not acct or not token:
+        sys.exit("YTKB_STT=cloudflare needs YTKB_CF_ACCOUNT_ID and YTKB_CF_API_TOKEN (env or ~/.env)")
+    body = Path(f"{path}.json")
+    body.write_text(json.dumps({"audio": base64.b64encode(Path(path).read_bytes()).decode(),
+                                "task": "transcribe", "initial_prompt": prompt}))
+    for attempt in range(1, 7):
+        # Token goes in via a stdin config so it never shows in `ps`.
+        r = subprocess.run(
+            ["curl", "-sS", "-K", "-", "-X", "POST",
+             f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{CF_MODEL}",
+             "-H", "Content-Type: application/json", "--data-binary", f"@{body}",
+             "-w", "\n%{http_code}"],
+            input=f'header = "Authorization: Bearer {token}"\n', capture_output=True, text=True,
+        )
+        out, _, code = r.stdout.rpartition("\n")
+        if code == "200":
+            data = json.loads(out)
+            if data.get("success"):
+                return data["result"], CF_MODEL.rsplit("/", 1)[1]
+        if code in ("429", "500", "502", "503", "504") and attempt < 6:
+            log(f"  cloudflare {code}, retrying in {30 * attempt}s")
+            time.sleep(30 * attempt)
+            continue
+        raise RuntimeError(f"cloudflare {code}: {out[:400]} {r.stderr[:200]}")
+
+
+def stt_provider():
+    p = (setting("YTKB_STT") or "groq").lower()
+    if p not in ("groq", "cloudflare"):
+        sys.exit(f"YTKB_STT must be groq or cloudflare, not {p!r}")
+    return p
+
+
 def whisper_segments(url, info, tmp):
     log("  no uploader captions; downloading audio")
     t0 = time.time()
@@ -288,18 +330,21 @@ def whisper_segments(url, info, tmp):
     prompt = f"{info.get('title', '')} — {info.get('channel', '')}"[:800]
     starts = {Path(name).name: float(start) for name, start, _ in
               (l.split(",") for l in Path(f"{tmp}/parts.csv").read_text().split())}
-    key, segs, used = groq_key(), [], set()
+    provider = stt_provider()
+    key = groq_key() if provider == "groq" else None
+    segs, used = [], set()
     parts = sorted(Path(tmp).glob("part_*.ogg"))
     for i, part in enumerate(parts):
         offset = starts[part.name]
-        log(f"  transcribing part {i + 1}/{len(parts)} with Groq")
+        log(f"  transcribing part {i + 1}/{len(parts)} with {provider}")
         t0 = time.time()
-        res, model = groq_transcribe(part, prompt, key)
+        res, model = (groq_transcribe(part, prompt, key) if provider == "groq"
+                      else cloudflare_transcribe(part, prompt))
         used.add(model)
         log(f"    {len(res.get('segments', []))} segments via {model} in {time.time() - t0:.0f}s")
         for s in res.get("segments", []):
             segs.append((offset + s["start"], s["text"].strip()))
-    return segs, "groq:" + "+".join(sorted(used))
+    return segs, f"{provider}:" + "+".join(sorted(used))
 
 
 def summarize(info, transcript):
