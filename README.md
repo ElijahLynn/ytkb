@@ -125,7 +125,9 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 
 | Variable | Default |
 | --- | --- |
-| `YTKB_STT` | `groq`, or `cloudflare` for Workers AI `whisper-large-v3-turbo` (~$0.03/audio hour) |
+| `YTKB_STT` | `groq` (default), `deepinfra`, `together`, `fireworks`, or `cloudflare` (turbo only) |
+| `YTKB_STT_MODEL` | override the provider's default Whisper model |
+| `YTKB_DEEPINFRA_API_KEY` / `YTKB_TOGETHER_API_KEY` / `YTKB_FIREWORKS_API_KEY` | key for that provider |
 | `YTKB_GROQ_API_KEY` | falls back to `GROQ_API_KEY` |
 | `YTKB_CF_ACCOUNT_ID` / `YTKB_CF_API_TOKEN` | Cloudflare account id + API token with Workers AI permission |
 | `YTKB_FREE` | unset; `1` = use YouTube auto-captions instead of Whisper (free, less accurate) |

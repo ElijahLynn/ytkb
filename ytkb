@@ -21,7 +21,8 @@ transcripts: uploader-written captions when available (free), otherwise Groq
 Whisper. In a Claude Code session the `ytkb` skill answers questions directly.
 
 settings (env or ~/.env; values may be op:// 1Password references):
-  YTKB_STT            groq (default) or cloudflare (Workers AI whisper-large-v3-turbo)
+  YTKB_STT            groq (default), deepinfra, together, fireworks, or cloudflare
+  YTKB_STT_MODEL      override the provider's default Whisper model
   YTKB_GROQ_API_KEY   Groq key (falls back to GROQ_API_KEY)
   YTKB_CF_ACCOUNT_ID, YTKB_CF_API_TOKEN   Cloudflare account + Workers AI token
   YTKB_FREE=1         always use --free (YouTube auto-captions instead of Whisper)
@@ -51,6 +52,18 @@ TOPICS = os.environ.get(
     "prompting, evals, agent architectures), software engineering practice, and "
     "business / startups / strategy / product / go-to-market",
 )
+# OpenAI-compatible Whisper providers: (endpoint, default model, key settings, fallback).
+# Only Groq's free tier needs a fallback: each of its models has its own rate limit.
+PROVIDERS = {
+    "groq": ("https://api.groq.com/openai/v1/audio/transcriptions", "whisper-large-v3",
+             ("YTKB_GROQ_API_KEY", "GROQ_API_KEY"), "whisper-large-v3-turbo"),
+    "deepinfra": ("https://api.deepinfra.com/v1/audio/transcriptions", "openai/whisper-large-v3",
+                  ("YTKB_DEEPINFRA_API_KEY", "DEEPINFRA_API_KEY"), None),
+    "together": ("https://api.together.ai/v1/audio/transcriptions", "openai/whisper-large-v3",
+                 ("YTKB_TOGETHER_API_KEY", "TOGETHER_API_KEY"), None),
+    "fireworks": ("https://audio-prod.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions",
+                  "whisper-v3", ("YTKB_FIREWORKS_API_KEY", "FIREWORKS_API_KEY"), None),
+}
 GROQ_MODEL = os.environ.get("YTKB_GROQ_MODEL", "whisper-large-v3")
 GROQ_FALLBACK = os.environ.get("YTKB_GROQ_FALLBACK", "whisper-large-v3-turbo")
 CLAUDE_MODEL = os.environ.get("YTKB_CLAUDE_MODEL", "sonnet")
@@ -218,25 +231,33 @@ def parse_duration(s):
     return sum(float(n) * unit[u] for n, u in re.findall(r"([\d.]+)(ms|h|m|s)", s or ""))
 
 
-def groq_transcribe(path, prompt, key):
-    """Returns (response, model). Each Groq model has its own rate limit, so on a 429
-    we try the fallback model before waiting for the limit to reset."""
-    models = [GROQ_MODEL] + ([GROQ_FALLBACK] if GROQ_FALLBACK and GROQ_FALLBACK != GROQ_MODEL else [])
+def provider_key(provider):
+    names = PROVIDERS[provider][2]
+    return secret(*names) or sys.exit(f"{provider} needs {' or '.join(names)} (env or ~/.env)")
+
+
+def groq_transcribe(path, prompt, key, provider="groq"):
+    """OpenAI-compatible /audio/transcriptions. Returns (response, model). On a 429 we try
+    the provider's fallback model (Groq only) before waiting for the limit to reset."""
+    url, model0, _, fallback = PROVIDERS[provider]
+    if provider == "groq":
+        model0, fallback = GROQ_MODEL, GROQ_FALLBACK
+    model0 = setting("YTKB_STT_MODEL") or model0
+    models = [model0] + ([fallback] if fallback and fallback != model0 else [])
     hdr, limited, errors = Path(f"{path}.hdr"), {}, 0
     while True:
         model = next((m for m in models if limited.get(m, 0) <= time.time()), None)
         if model is None:
             wait = min(limited.values()) - time.time() + 2
-            log(f"  Groq rate limit on all models; waiting {ts(wait)} "
-                "(free tier = 2h audio/hour/model; upgrade: console.groq.com/settings/billing)")
+            log(f"  {provider} rate limit; waiting {ts(wait)}")
             time.sleep(max(wait, 1))
             continue
         # The auth header goes in via a stdin config so the key never shows in `ps`.
         r = subprocess.run(
-            ["curl", "-sS", "-K", "-", "-D", str(hdr),
-             "https://api.groq.com/openai/v1/audio/transcriptions",
-             "-F", f"file=@{path}",
+            ["curl", "-sS", "-K", "-", "-D", str(hdr), url,
+             # model before file: some providers stream the upload and need it first
              "-F", f"model={model}", "-F", "response_format=verbose_json",
+             "-F", "timestamp_granularities[]=segment", "-F", f"file=@{path}",
              *(["--form-string", f"prompt={prompt}"] if prompt else []), "-w", "\n%{http_code}"],
             input=f'header = "Authorization: Bearer {key}"\n', capture_output=True, text=True,
         )
@@ -252,10 +273,10 @@ def groq_transcribe(path, prompt, key):
             continue
         errors += 1
         if code in ("500", "502", "503") and errors < 6:
-            log(f"  groq {code}, retrying in {30 * errors}s")
+            log(f"  {provider} {code}, retrying in {30 * errors}s")
             time.sleep(30 * errors)
             continue
-        raise RuntimeError(f"groq {code}: {body[:300]} {r.stderr[:300]}")
+        raise RuntimeError(f"{provider} {code}: {body[:300]} {r.stderr[:300]}")
 
 
 CF_MODEL = "@cf/openai/whisper-large-v3-turbo"
@@ -295,8 +316,8 @@ def cloudflare_transcribe(path, prompt):
 
 def stt_provider():
     p = (setting("YTKB_STT") or "groq").lower()
-    if p not in ("groq", "cloudflare"):
-        sys.exit(f"YTKB_STT must be groq or cloudflare, not {p!r}")
+    if p not in (*PROVIDERS, "cloudflare"):
+        sys.exit(f"YTKB_STT must be one of {', '.join([*PROVIDERS, 'cloudflare'])}, not {p!r}")
     return p
 
 
@@ -335,15 +356,15 @@ def whisper_segments(url, info, tmp):
     starts = {Path(name).name: float(start) for name, start, _ in
               (l.split(",") for l in Path(f"{tmp}/parts.csv").read_text().split())}
     provider = stt_provider()
-    key = groq_key() if provider == "groq" else None
+    key = provider_key(provider) if provider in PROVIDERS else None
     segs, used = [], set()
     parts = sorted(Path(tmp).glob("part_*.ogg"))
     for i, part in enumerate(parts):
         offset = starts[part.name]
         log(f"  transcribing part {i + 1}/{len(parts)} with {provider}")
         t0 = time.time()
-        res, model = (groq_transcribe(part, prompt, key) if provider == "groq"
-                      else cloudflare_transcribe(part, prompt))
+        res, model = (cloudflare_transcribe(part, prompt) if provider == "cloudflare"
+                      else groq_transcribe(part, prompt, key, provider))
         used.add(model)
         log(f"    {len(res.get('segments', []))} segments via {model} in {time.time() - t0:.0f}s")
         for s in res.get("segments", []):
