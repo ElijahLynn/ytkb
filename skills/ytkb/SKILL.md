@@ -19,6 +19,7 @@ answering yourself in this session — don't call `ytkb ask` (it spawns a nested
    The index is SQLite FTS5 with porter stemming: use `OR`, `AND`, `NEAR(a b, 10)`,
    `"quoted phrases"`, and `prefix*`. Plain words are OR'd automatically.
    Each hit prints `[Title @ m:ss] https://youtu.be/ID?t=SECONDS` and the line.
+   To search inside one video: `ytkb search '"code review" OR reviewer' --video ID`.
 3. **Read context** around promising hits before quoting them — single lines are often fragments:
    `ytkb show ID --at SECONDS --window 180`
    For a whole video's gist: `ytkb show ID --summary`. Full transcript: `ytkb show ID` (long).

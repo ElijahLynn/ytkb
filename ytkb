@@ -581,12 +581,13 @@ def cmd_process(con, a):
 
 # ---------------------------------------------------------------- query
 
-def fts_search(con, query, limit):
+def fts_search(con, query, limit, video=None):
     return con.execute(
         "select s.video_id, s.start, s.text, v.title, v.channel, v.upload_date "
         "from segments_fts s join videos v on v.id = s.video_id "
-        "where segments_fts match ? order by bm25(segments_fts) limit ?",
-        (query, limit),
+        "where segments_fts match ? and (? is null or s.video_id = ?) "
+        "order by bm25(segments_fts) limit ?",
+        (query, video, video, limit),
     ).fetchall()
 
 
@@ -599,7 +600,8 @@ def fts_quote(q):
 
 
 def cmd_search(con, a):
-    for r in fts_search(con, fts_quote(a.query), a.n):
+    video = video_id(a.video) if a.video else None
+    for r in fts_search(con, fts_quote(a.query), a.n, video):
         print(f"[{r['title']} @ {ts(r['start'])}] https://youtu.be/{r['video_id']}?t={int(r['start'])}")
         print(f"   {r['text']}\n")
 
@@ -770,6 +772,7 @@ def main():
     s = cmd("search", "full-text search; prints timestamped links")
     s.add_argument("query", help='words, or FTS5 syntax: "exact phrase" OR prefix* NEAR(a b)')
     s.add_argument("-n", type=int, default=15, help="max results (default 15)")
+    s.add_argument("--video", help="only search this video (id or URL)")
     s = cmd("show", "print a video's timestamped transcript or summary")
     s.add_argument("id", help="video id or URL")
     s.add_argument("--summary", action="store_true", help="summary instead of transcript")
