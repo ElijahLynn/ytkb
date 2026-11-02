@@ -95,8 +95,16 @@ echo 'YTKB_BROWSER=brave' >> ~/.env    # or firefox, chrome, chromium, ...
 ytkb add "https://www.youtube.com/feed/history"   # -n 300 for just the latest
 ```
 
-History is mostly off-topic, so it's queued, Claude keeps the videos matching
-`YTKB_TOPICS` (by title), and only those are transcribed.
+History is mostly off-topic, so it's queued and Claude pre-checks the videos
+it thinks you want (by title). A picker opens: ↑↓ move, space toggles, `a`
+all/none, enter imports. Only checked videos are transcribed.
+
+**The filter learns from you.** Every time you confirm the picker, your choices
+are saved, especially your corrections: videos you checked that Claude missed
+and ones it picked that you unchecked. Future filtering shows Claude those
+titles as examples alongside `YTKB_TOPICS`, and follows the examples when they
+disagree. Videos you `ytkb add` directly count as wanted. `ytkb taste` shows
+what it has learned.
 
 For your **entire** history (the feed only reaches back so far):
 
