@@ -815,11 +815,19 @@ def pick(items, preselected):
 
 
 def cmd_pick(con, a):
+    # Hide videos you already reviewed and left unchecked (their `choice` is set);
+    # --all shows them again.
+    shown = ("status in ('new','relevant','skip')" if getattr(a, "all", False) else
+             "(status in ('new','relevant') or (status = 'skip' and choice is null))")
     rows = con.execute("select id, title, channel, watched_at, status, guess from queue "
-                       "where status in ('new','relevant','skip') "
-                       f"order by {QUEUE_ORDER}").fetchall()
+                       f"where {shown} order by {QUEUE_ORDER}").fetchall()
     if not rows:
-        sys.exit("queue is empty; import your history first: ytkb history")
+        sys.exit("nothing new to pick; import more with: ytkb history"
+                 + ("" if getattr(a, "all", False) else "  (or ytkb pick --all to revisit skipped videos)"))
+    hidden = 0 if getattr(a, "all", False) else con.execute(
+        "select count(*) from queue where status = 'skip' and choice is not null").fetchone()[0]
+    if hidden:
+        log(f"{len(rows)} to review; {hidden} you skipped before are hidden (ytkb pick --all shows them).")
     # ✦ marks Claude's picks, so you can tell them from your own.
     items = [(r["id"], ("✦ " if r["guess"] == "want" else "  ") + "  ".join(x for x in (
                   (r["watched_at"] or "")[:10], r["title"] or r["id"],
@@ -1198,6 +1206,7 @@ def main():
     s.add_argument("--at", type=float, help="only lines around this second")
     s.add_argument("--window", type=float, default=120, help="seconds of context for --at (default 120)")
     s = cmd("pick", "choose queued videos with the arrow keys, then ingest them")
+    s.add_argument("--all", action="store_true", help="also show videos you skipped before")
     s.add_argument("--no-summary", action="store_true", help="skip Claude summaries")
     cmd("taste", "show what the filter has learned from your picks")
     cmd("summarize", "write missing summaries")
