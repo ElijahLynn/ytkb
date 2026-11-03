@@ -653,10 +653,13 @@ def expand(url, limit=None):
             raise RuntimeError("this URL needs your YouTube login: set YTKB_BROWSER=brave "
                                "(or firefox, chrome, ...) in ~/.env so ytkb can use that "
                                "browser's YouTube cookies")
-        log(f"  reading your YouTube login from {browser}")
+        log(f"Using your YouTube login from {browser.capitalize()}.")
         cmd += ["--cookies-from-browser", browser]
-    log(f"  listing {url}" + (f" (latest {limit})" if limit else " (all of it; -n N for just the latest)"))
-    log("  waiting for YouTube's first page...")
+    what = ("watched videos" if HISTORY_URL.search(url) else "Watch Later videos" if "list=WL" in url
+            else "liked videos" if "list=LL" in url else f"videos from {url}")
+    log(f"Getting your last {limit} {what} from YouTube..." if limit and what[0] != "v" else
+        f"Getting {'the latest ' + str(limit) + ' ' if limit else 'all '}{what} from YouTube"
+        f"{'' if limit else ' (-n N for just the latest)'}...")
     proc = subprocess.Popen(cmd + [url], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     items, t0 = [], time.time()
     for line in proc.stdout:
@@ -665,7 +668,7 @@ def expand(url, limit=None):
         if video_id(vid):
             items.append(dict(id=vid, title=title, channel=None if channel == "NA" else channel))
             if len(items) == 1 or len(items) % 10 == 0:
-                print(f"\r  listed {len(items)} videos ({time.time() - t0:.0f}s)...", end="",
+                print(f"\r  {len(items)} so far ({time.time() - t0:.0f} s)...", end="",
                       file=sys.stderr, flush=True)
     err = proc.stderr.read()
     if proc.wait() != 0 and not items:
@@ -673,7 +676,7 @@ def expand(url, limit=None):
         raise RuntimeError(f"yt-dlp: {' '.join(lines)}")
     if items:
         print(file=sys.stderr)
-    log(f"  listed {len(items)} videos in {time.time() - t0:.0f}s")
+    log(f"Got {len(items)} videos ({time.time() - t0:.0f} s).")
     return items
 
 
@@ -778,7 +781,8 @@ def enqueue(con, items):
                 "values(?,?,?,?,?,?)",
                 (it["id"], it["title"], it.get("channel"), it.get("watched_at"), now, pos),
             ).rowcount
-    log(f"queued {n} new videos ({len(items) - n} already known)")
+    log(f"{n} are new; {len(items) - n} came in an earlier import." if len(items) - n else
+        f"All {n} are new.")
 
 
 def cmd_import_takeout(con, a):
@@ -834,8 +838,8 @@ def cmd_taste(con, a):
 def cmd_triage(con, a):
     rows = con.execute("select id,title,channel from queue where status='new'").fetchall()
     taste = taste_examples(con)
-    log(f"triaging {len(rows)} videos"
-        + (f" (learning from {taste.count(chr(10) + '- ')} of your past choices)" if taste else ""))
+    log(f"Claude is picking the relevant ones out of {len(rows)}"
+        + (f", guided by {taste.count(chr(10) + '- ')} of your past picks" if taste else "") + "...")
     for i in range(0, len(rows), 150):
         batch = rows[i:i + 150]
         listing = "\n".join(f"{r['id']}\t{r['title']}\t{r['channel'] or ''}" for r in batch)
@@ -853,14 +857,14 @@ def cmd_triage(con, a):
         try:
             keep = set(json.loads(out[out.index("["): out.rindex("]") + 1]))
         except ValueError:
-            log(f"! could not parse triage output for batch {i // 150 + 1}, skipping it")
+            log(f"! Claude's answer for videos {i + 1}-{i + len(batch)} couldn't be read; they stay unpicked")
             continue
         with con:
             for r in batch:
                 want = r["id"] in keep
                 con.execute("update queue set status=?, guess=? where id=?",
                             ("relevant" if want else "skip", "want" if want else "skip", r["id"]))
-        log(f"  batch {i // 150 + 1}: {len(keep & {r['id'] for r in batch})}/{len(batch)} relevant")
+        log(f"  {len(keep & {r['id'] for r in batch})} of {len(batch)} look relevant")
     cmd_stats(con, a)
 
 
