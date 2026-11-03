@@ -656,6 +656,7 @@ def expand(url, limit=None):
         log(f"  reading your YouTube login from {browser}")
         cmd += ["--cookies-from-browser", browser]
     log(f"  listing {url}" + (f" (latest {limit})" if limit else " (all of it; -n N for just the latest)"))
+    log("  waiting for YouTube's first page...")
     proc = subprocess.Popen(cmd + [url], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     items, t0 = [], time.time()
     for line in proc.stdout:
@@ -663,14 +664,14 @@ def expand(url, limit=None):
         title, _, channel = rest.partition("\t")
         if video_id(vid):
             items.append(dict(id=vid, title=title, channel=None if channel == "NA" else channel))
-            if len(items) % 100 == 0:
+            if len(items) == 1 or len(items) % 10 == 0:
                 print(f"\r  listed {len(items)} videos ({time.time() - t0:.0f}s)...", end="",
                       file=sys.stderr, flush=True)
     err = proc.stderr.read()
     if proc.wait() != 0 and not items:
         lines = [l for l in err.splitlines() if "ERROR" in l] or err.splitlines()[-1:]
         raise RuntimeError(f"yt-dlp: {' '.join(lines)}")
-    if len(items) >= 100:
+    if items:
         print(file=sys.stderr)
     log(f"  listed {len(items)} videos in {time.time() - t0:.0f}s")
     return items
