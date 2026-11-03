@@ -43,6 +43,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -102,7 +103,7 @@ create table if not exists queue(
 
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
     cols = {r["name"] for r in con.execute("pragma table_info(queue)")}
@@ -124,8 +125,14 @@ def db():
     return con
 
 
+_tls = threading.local()  # per-thread log prefix, e.g. "[3/99] " when processing in parallel
+
+
 def log(*a):
-    print(*a, file=sys.stderr, flush=True)
+    prefix = getattr(_tls, "prefix", "")
+    msg = " ".join(str(x) for x in a)
+    print("\n".join(prefix + line for line in msg.split("\n")) if prefix else msg,
+          file=sys.stderr, flush=True)
 
 
 def run(cmd, **kw):
@@ -356,13 +363,19 @@ def assemblyai_transcribe(path):
             raise RuntimeError(f"assemblyai {code or 'timeout'}: {body[:300]} {r.stderr[:200]}")
 
     size_mb = Path(path).stat().st_size / 1e6
+    log(f"  uploading {size_mb:.0f} MB to AssemblyAI...")
     upload = call([f"{api}/upload", "--data-binary", f"@{path}"], max_time=max(60, size_mb * 5))
+    log("  AssemblyAI is transcribing...")
+    t0, last = time.time(), 0
     job = call([f"{api}/transcript", "-H", "Content-Type: application/json", "--data",
                 json.dumps({"audio_url": upload["upload_url"], "speech_models": [ASSEMBLYAI_MODEL]})])
     deadline = time.time() + max(300, size_mb * 30)  # generous; typical: ~20 s per 10 min
     while time.time() < deadline:
         time.sleep(3)
         res = call([f"{api}/transcript/{job['id']}"])
+        if time.time() - t0 - last >= 30 and res["status"] != "completed":
+            last = int(time.time() - t0) // 30 * 30
+            log(f"  still transcribing ({last} s)...")
         if res["status"] == "completed":
             words = [{"word": w["text"], "start": w["start"] / 1000} for w in res.get("words") or []]
             segs, _ = align_text(res.get("text") or "", words) if words else ([], 0)
@@ -414,14 +427,34 @@ def stt_provider():
     return p
 
 
+def download_audio(url, tmp):
+    proc = subprocess.Popen(
+        ["yt-dlp", "-f", "ba[acodec=opus][abr<=80]/wa[acodec=opus]/wa/ba/b", "-N", "4",
+         "--newline", "--progress-template", "download:PROGRESS %(progress._percent_str)s %(progress._speed_str)s",
+         "-o", f"{tmp}/src.%(ext)s", url],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    shown = 0
+    for line in proc.stdout:
+        m = re.match(r"PROGRESS\s+([\d.]+)%\s*(\S*)", line.strip())
+        if m and float(m.group(1)) >= shown + 25:
+            shown = int(float(m.group(1)) // 25 * 25)
+            log(f"  downloading audio: {shown}% ({m.group(2)})")
+    err = proc.stderr.read()
+    if proc.wait() != 0:
+        lines = [l for l in err.splitlines() if "ERROR" in l] or err.splitlines()[-1:]
+        raise RuntimeError(f"yt-dlp: {' '.join(lines)}")
+
+
 def whisper_segments(url, info, tmp):
     log("  no uploader captions; downloading audio")
     t0 = time.time()
     # YouTube's ~50-70 kbps Opus tracks are plenty for speech (Whisper works at 16 kHz
     # mono internally), and 20 min of them is ~8-11 MB, under Groq's 25 MB cap, so they
     # can be split without re-encoding.
-    run(["yt-dlp", "-f", "ba[acodec=opus][abr<=80]/ba[acodec=opus]/ba/b",
-         "-o", f"{tmp}/src.%(ext)s", url])
+    # Smallest decent audio: a low-bitrate Opus track if there is one, else the smallest
+    # audio track (speech models work at 16 kHz mono; big tracks just download slowly).
+    # -N 4 fetches four pieces at once.
+    download_audio(url, tmp)
     src = next(Path(tmp).glob("src.*"))
     if stt_provider() == "assemblyai":
         log(f"  downloaded {src.stat().st_size / 1e6:.0f} MB in {time.time() - t0:.0f}s; "
@@ -722,7 +755,7 @@ def pick(items, preselected):
     except (OSError, ValueError):
         pass
     save = lambda: PICK_DRAFT.write_text(json.dumps(sorted(sel)))
-    help_ = "↑↓ move  space toggle  a all/none  enter import  q cancel"
+    help_ = "↑↓ move  space toggle  a all/none  enter done  q cancel  ✦ = Claude's pick"
     digits = len(str(len(items)))
 
     def put(scr, y, text, attr, w):
@@ -782,12 +815,13 @@ def pick(items, preselected):
 
 
 def cmd_pick(con, a):
-    rows = con.execute("select id, title, channel, watched_at, status from queue "
+    rows = con.execute("select id, title, channel, watched_at, status, guess from queue "
                        "where status in ('new','relevant','skip') "
                        f"order by {QUEUE_ORDER}").fetchall()
     if not rows:
         sys.exit("queue is empty; import your history first: ytkb history")
-    items = [(r["id"], "  ".join(x for x in (
+    # ✦ marks Claude's picks, so you can tell them from your own.
+    items = [(r["id"], ("✦ " if r["guess"] == "want" else "  ") + "  ".join(x for x in (
                   (r["watched_at"] or "")[:10], r["title"] or r["id"],
                   f"— {r['channel']}" if r["channel"] else "") if x))
              for r in rows]
@@ -801,8 +835,17 @@ def cmd_pick(con, a):
             con.execute("update queue set status=?, choice=? where id=?",
                         ("relevant" if want else "skip", "want" if want else "skip", r["id"]))
     fixed = sum(1 for r in rows if (r["id"] in chosen) != (r["status"] == "relevant"))
-    log(f"{len(chosen)} selected" + (f"; learned from {fixed} change(s) to Claude's picks" if fixed else ""))
-    cmd_process(con, argparse.Namespace(n=None, sleep=getattr(a, "sleep", 5),
+    by_claude = sum(1 for r in rows if r["id"] in chosen and r["guess"] == "want")
+    log(f"{len(chosen)} selected: {len(chosen) - by_claude} you picked, {by_claude} of Claude's picks (✦)."
+        + (f" Learned from {fixed} change(s) to Claude's picks." if fixed else ""))
+    if not chosen:
+        return
+    if sys.stdin.isatty():
+        answer = input(f"Transcribe these {len(chosen)} now? [Y/n] ").strip().lower()
+        if answer.startswith("n"):
+            log("Saved. Run `ytkb process` when you're ready.")
+            return
+    cmd_process(con, argparse.Namespace(n=None, sleep=getattr(a, "sleep", 5), jobs=3,
                                         no_summary=getattr(a, "no_summary", False)))
 
 
@@ -911,17 +954,43 @@ def cmd_triage(con, a):
 def cmd_process(con, a):
     rows = con.execute(f"select id from queue where status='relevant' order by {QUEUE_ORDER} "
                        + (f"limit {int(a.n)}" if a.n else "")).fetchall()
-    log(f"processing {len(rows)} videos")
-    for i, r in enumerate(rows):
-        log(f"[{i + 1}/{len(rows)}]")
+    jobs = max(1, getattr(a, "jobs", 3) or 3)
+    total = len(rows)
+    if not total:
+        log("Nothing selected to process.")
+        return
+    log(f"Processing {total} videos, {jobs} at a time.")
+    from concurrent.futures import ThreadPoolExecutor
+    state = {"done": 0, "failed": 0, "t0": time.time()}
+    lock = threading.Lock()
+
+    def one(i, vid):
+        _tls.prefix = f"[{i}/{total}] "
+        wcon = db()  # each worker gets its own connection
         try:
-            ingest(con, r["id"], not a.no_summary)
+            ingest(wcon, vid, not a.no_summary)
+            ok = True
         except Exception as e:
-            log(f"! {r['id']}: {e}")
-            with con:
-                con.execute("update queue set status='failed', note=? where id=?",
-                            (str(e)[:500], r["id"]))
+            log(f"! {vid}: {e}")
+            with wcon:
+                wcon.execute("update queue set status='failed', note=? where id=?", (str(e)[:500], vid))
+            ok = False
+        finally:
+            wcon.close()
+        with lock:
+            state["done" if ok else "failed"] += 1
+            finished = state["done"] + state["failed"]
+            per = (time.time() - state["t0"]) / finished
+            log(f"== {finished}/{total} finished ({state['failed']} failed), "
+                f"about {max(0, (total - finished) * per) / 60:.0f} min left")
         time.sleep(a.sleep)  # be gentle with YouTube
+
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        for f in [ex.submit(one, i, r["id"]) for i, r in enumerate(rows, 1)]:
+            f.result()
+    _tls.prefix = ""
+    log(f"Done: {state['done']} ingested, {state['failed']} failed, "
+        f"{(time.time() - state['t0']) / 60:.0f} min.")
 
 
 # ---------------------------------------------------------------- query
@@ -1110,6 +1179,7 @@ def main():
     cmd("triage", "have Claude mark queued videos relevant/skip by title (YTKB_TOPICS)")
     s = cmd("process", "ingest queued videos marked relevant, newest first")
     s.add_argument("-n", type=int, help="at most N videos")
+    s.add_argument("-j", "--jobs", type=int, default=3, help="videos at a time (default 3)")
     s.add_argument("--sleep", type=float, default=5, help="seconds between videos (default 5)")
     s.add_argument("--no-summary", action="store_true", help="skip Claude summaries")
     s = cmd("ask", "answer a question from the knowledge base, with timestamp links")
