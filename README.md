@@ -50,13 +50,16 @@ git clone https://github.com/ElijahLynn/ytkb ~/projects/ytkb
 ln -s ~/projects/ytkb/ytkb ~/.local/bin/ytkb
 ```
 
-Add a Groq API key ([https://console.groq.com/keys](https://console.groq.com/keys))
-to `~/.env` or your environment. A 1Password reference works too:
+Pick a transcription service and add its key to `~/.env` (or your environment).
+AssemblyAI is recommended (most accurate; $50 free credit). A 1Password `op://`
+reference works for any key:
 
 ```bash
-YTKB_GROQ_API_KEY=gsk_...
-# or
-YTKB_GROQ_API_KEY=op://vault/item/credential
+YTKB_STT=assemblyai
+YTKB_ASSEMBLYAI_API_KEY=...        # https://www.assemblyai.com/dashboard/api-keys
+# or, e.g. Groq's free tier:
+# YTKB_STT=groq
+# YTKB_GROQ_API_KEY=op://vault/item/credential   # https://console.groq.com/keys
 ```
 
 ### Claude Code skill (optional)
