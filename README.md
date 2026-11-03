@@ -77,7 +77,7 @@ ln -s ~/projects/ytkb/skills/ytkb ~/.claude/skills/ytkb
 ytkb add "https://youtu.be/VIDEO_ID"            # ingest (no args: clipboard)
 ytkb add "https://www.youtube.com/@Channel" -n 10       # latest 10 videos
 ytkb add "https://www.youtube.com/playlist?list=..."    # a whole playlist
-ytkb add "https://www.youtube.com/feed/history"         # recent history, filtered
+ytkb history                                     # your watch history, filtered (also: ytkb add later / liked)
 ytkb ask "how are people doing evals for coding agents?"   # one-shot answer
 ytkb chat "how are people doing evals for coding agents?"  # conversation: follow-ups keep context
 ytkb pick                                        # choose queued videos with ↑↓ / space / enter
@@ -89,14 +89,14 @@ ytkb list | ytkb stats
 
 ### Your watch history
 
-Pasting [https://www.youtube.com/feed/history](https://www.youtube.com/feed/history)
-(or Watch Later / Liked videos) needs your YouTube login. `ytkb` doesn't ask
+`ytkb history` (and `ytkb add later` / `ytkb add liked` for Watch Later and Liked
+videos) needs your YouTube login. `ytkb` doesn't ask
 for a password; it has yt-dlp reuse the login cookies of a browser where you're
 signed in to YouTube:
 
 ```bash
 echo 'YTKB_BROWSER=brave' >> ~/.env    # or firefox, chrome, chromium, ...
-ytkb add "https://www.youtube.com/feed/history"   # -n 300 for just the latest
+ytkb history            # -n 300 for just the latest
 ```
 
 History is mostly off-topic, so it's queued and Claude pre-checks the videos

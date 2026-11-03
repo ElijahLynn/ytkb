@@ -8,7 +8,7 @@ the moment something was said.
 examples:
   ytkb add "https://youtu.be/VIDEO_ID"         save one video
   ytkb add "https://www.youtube.com/@Channel" -n 10   latest 10 from a channel
-  ytkb add "https://www.youtube.com/feed/history"     recent history, filtered
+  ytkb history                                        your watch history, filtered
   ytkb ask "how are people doing evals for coding agents?"   one-shot answer
   ytkb chat "how are people doing evals for coding agents?"  conversation with follow-ups
   ytkb search '"autonomy slider" OR leash'
@@ -589,6 +589,21 @@ def _ingest(con, vid, with_summary, replace=False):
     return vid
 
 
+# Your own lists have the same URL for everyone, so they get short names.
+LIST_SHORTCUTS = {
+    "history": "https://www.youtube.com/feed/history",
+    "later": "https://www.youtube.com/playlist?list=WL",
+    "watch-later": "https://www.youtube.com/playlist?list=WL",
+    "liked": "https://www.youtube.com/playlist?list=LL",
+}
+
+
+def cmd_history(con, a):
+    """`ytkb history` = `ytkb add history`: queue your watch history, pick, ingest."""
+    a.urls, a.redo = ["history"], False
+    cmd_add(con, a)
+
+
 def cmd_add(con, a):
     urls = a.urls
     if not urls:
@@ -599,6 +614,7 @@ def cmd_add(con, a):
         else:
             sys.exit("no URL given and no clipboard tool (wl-clipboard) found")
     for u in urls:
+        u = LIST_SHORTCUTS.get(u.lower(), u)
         try:
             if video_id(u):
                 ingest(con, u, not a.no_summary, redo=a.redo)
@@ -709,7 +725,7 @@ def cmd_pick(con, a):
                        "where status in ('new','relevant','skip') "
                        f"order by {QUEUE_ORDER}").fetchall()
     if not rows:
-        sys.exit("queue is empty; add your history first (ytkb add https://www.youtube.com/feed/history)")
+        sys.exit("queue is empty; import your history first: ytkb history")
     items = [(r["id"], "  ".join(x for x in (
                   (r["watched_at"] or "")[:10], r["title"] or r["id"],
                   f"— {r['channel']}" if r["channel"] else "") if x))
@@ -1015,9 +1031,12 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", metavar="COMMAND", title="commands")
     cmd = lambda name, help: sp.add_parser(name, help=help, description=help)
-    s = cmd("add", "ingest videos, playlists, channels or your history (no args: clipboard)")
-    s.add_argument("urls", nargs="*", help="video, playlist, channel, or "
-                   "https://www.youtube.com/feed/history (needs YTKB_BROWSER)")
+    s = cmd("history", "import your YouTube watch history: Claude pre-picks, you confirm (needs YTKB_BROWSER)")
+    s.add_argument("-n", type=int, help="only the N most recent videos")
+    s.add_argument("--no-summary", action="store_true", help="skip Claude summaries")
+    s = cmd("add", "ingest videos, playlists, channels, or: history, later, liked (no args: clipboard)")
+    s.add_argument("urls", nargs="*", help="video, playlist or channel URLs, or history / later / liked "
+                   "(your own lists; need YTKB_BROWSER)")
     s.add_argument("-n", type=int, help="playlist/channel/history: only the N most recent")
     s.add_argument("--no-summary", action="store_true", help="skip the Claude summary")
     s.add_argument("--redo", action="store_true", help="re-transcribe videos already saved")
