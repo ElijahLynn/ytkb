@@ -24,12 +24,12 @@ transcript lines.
 ## How it works
 
 1. **Transcript.** If the uploader wrote captions, `ytkb` uses them (free,
-   accurate). Otherwise it downloads YouTube's small Opus audio track, splits it
-   into 3-minute chunks without re-encoding, and transcribes up to 8 chunks at a
-   time. Each request has a 15 s limit and is retried if it stalls, so one stuck
-   request can't hold up a whole video. Providers: Groq, DeepInfra, Cloudflare
-   Workers AI and others (`YTKB_STT`). No prompt is sent: with the title as a
-   prompt, Whisper large-v3 sometimes echoed it in place of ~30 s of speech.
+   accurate). Otherwise it downloads YouTube's small Opus audio track and
+   transcribes it. Recommended: [AssemblyAI](https://www.assemblyai.com)
+   (`YTKB_STT=assemblyai`), the most accurate service tested: the whole file goes
+   up in one request and its word timestamps give one line per sentence. Other
+   providers (Groq, DeepInfra, Cloudflare Workers AI, ...) take 3-minute chunks,
+   up to 8 at a time. Every request has a time limit and is retried if it stalls.
 2. **Summary.** Claude (via the [Claude Code](https://claude.com/claude-code)
    CLI, so it runs on your Claude subscription) writes a summary and a list of
    the concrete techniques and claims.
@@ -122,23 +122,27 @@ ytkb process -n 20          # newest first; re-run to continue
 ### Choosing a speech model
 
 Accuracy on 6 captioned technical talks (~9,800 words, 10 minutes each, scored
-against the uploaders' captions; lower is better):
+against the uploaders' captions; lower is better), 2026-11-02:
 
-| Model (DeepInfra) | Word errors | Notes |
-|---|---|---|
-| `Qwen/Qwen3-ASR-1.7B` | **3.6%** | Most accurate. Its word timestamps start a line at each sentence |
-| `mistralai/Voxtral-Mini-3B-2507` | 3.8% | No timestamps of its own |
-| `openai/whisper-large-v3` | 5.4% | Default |
+| Service / model | Word errors | Time per 10 min | Price / audio hour |
+|---|---|---|---|
+| **AssemblyAI** `universal-3-5-pro` (`YTKB_STT=assemblyai`) | **3.46%** | 14–23 s | $0.21 |
+| DeepInfra `Qwen/Qwen3-ASR-1.7B` | 3.60% | 3–7 s when healthy | ~$0.03 |
+| DeepInfra `mistralai/Voxtral-Mini-3B-2507` | 3.82% | 14–20 s | ~$0.06 |
+| ElevenLabs `scribe_v2` (3 of the 6 talks) | 4.16% | 8–11 s | $0.22 |
+| Speechmatics Enhanced | 4.71% | 20–47 s | $0.75 |
+| DeepInfra / Groq `openai/whisper-large-v3` | 5.38% | ~12 s | $0.03–0.11 |
 
-Qwen3 makes about a third fewer errors than Whisper large-v3, but DeepInfra's Qwen3
-went from ~5 s to over 60 s per request on 2026-11-02, so it's opt-in for now:
+AssemblyAI makes about a third fewer errors than Whisper large-v3 and was reliable
+throughout; a 78-minute talk takes ~45 s. DeepInfra's Qwen3 is nearly as accurate
+and much cheaper, but went from ~5 s to over 60 s per request on 2026-11-02; it's
+available with `YTKB_STT=deepinfra` and `YTKB_STT_MODEL=Qwen/Qwen3-ASR-1.7B`.
+
+To re-transcribe saved videos with a different model:
 
 ```bash
-echo 'YTKB_STT_MODEL=Qwen/Qwen3-ASR-1.7B' >> ~/.env
-ytkb add --redo "https://youtu.be/VIDEO_ID"   # re-transcribe a saved video
+ytkb add --redo "https://youtu.be/VIDEO_ID"   # keeps the old transcript until this succeeds
 ```
-
-`--redo` keeps the old transcript until the new one has fully succeeded.
 
 ## Settings
 
@@ -146,7 +150,9 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 
 | Variable | Default |
 | --- | --- |
-| `YTKB_STT` | `groq` (default), `deepinfra`, `together`, `fireworks`, or `cloudflare` (turbo only) |
+| `YTKB_STT` | `assemblyai` (recommended), `groq` (default if unset), `deepinfra`, `together`, `fireworks`, or `cloudflare` (turbo only) |
+| `YTKB_ASSEMBLYAI_API_KEY` | AssemblyAI key ([https://www.assemblyai.com/dashboard/api-keys](https://www.assemblyai.com/dashboard/api-keys); $50 free credit) |
+| `YTKB_ASSEMBLYAI_MODEL` | `universal-3-5-pro` |
 | `YTKB_STT_MODEL` | override the provider's default model (e.g. `Qwen/Qwen3-ASR-1.7B` on DeepInfra) |
 | `YTKB_STT_TIMEOUT` | `15` seconds per transcription request before it's retried |
 | `YTKB_TIMING_MODEL` | `openai/whisper-large-v3-turbo`: word timings for text models that don't return their own |
@@ -162,6 +168,7 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 
 ## Costs
 
+- AssemblyAI: $0.21 per audio hour (new accounts get $50 of credit, ~240 hours).
 - DeepInfra: about $0.03 per audio hour for Whisper large-v3 or Qwen3-ASR.
 - Groq Whisper: about $0.11 per audio hour (`large-v3`); the free tier allows
   about 2 hours of audio per hour per model, and `ytkb` waits out the limit.

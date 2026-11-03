@@ -330,6 +330,48 @@ def align_text(text, wwords):
     return segs, len(known) / max(1, len(vwords))
 
 
+ASSEMBLYAI_MODEL = os.environ.get("YTKB_ASSEMBLYAI_MODEL", "universal-3-5-pro")
+
+
+def assemblyai_transcribe(path):
+    """AssemblyAI (whole file, no chunking): upload, submit, poll. Returns (response with
+    one segment per sentence, model). Most accurate in our captioned-talk benchmark."""
+    key = secret("YTKB_ASSEMBLYAI_API_KEY") or sys.exit(
+        "YTKB_STT=assemblyai needs YTKB_ASSEMBLYAI_API_KEY (env or ~/.env)")
+    api = "https://api.assemblyai.com/v2"
+
+    def call(args, max_time=STT_TIMEOUT, tries=3):
+        for attempt in range(1, tries + 1):
+            # The key goes in via a stdin config so it never shows in `ps`.
+            r = subprocess.run(["curl", "-sS", "-K", "-", "--max-time", str(max_time), *args,
+                                "-w", "\n%{http_code}"],
+                               input=f'header = "authorization: {key}"\n', capture_output=True, text=True)
+            body, _, code = r.stdout.rpartition("\n")
+            if code == "200":
+                return json.loads(body)
+            if (r.returncode == 28 or code in ("429", "500", "502", "503", "504")) and attempt < tries:
+                log(f"  assemblyai {code or 'timeout'}, retrying")
+                time.sleep(3 * attempt)
+                continue
+            raise RuntimeError(f"assemblyai {code or 'timeout'}: {body[:300]} {r.stderr[:200]}")
+
+    size_mb = Path(path).stat().st_size / 1e6
+    upload = call([f"{api}/upload", "--data-binary", f"@{path}"], max_time=max(60, size_mb * 5))
+    job = call([f"{api}/transcript", "-H", "Content-Type: application/json", "--data",
+                json.dumps({"audio_url": upload["upload_url"], "speech_models": [ASSEMBLYAI_MODEL]})])
+    deadline = time.time() + max(300, size_mb * 30)  # generous; typical: ~20 s per 10 min
+    while time.time() < deadline:
+        time.sleep(3)
+        res = call([f"{api}/transcript/{job['id']}"])
+        if res["status"] == "completed":
+            words = [{"word": w["text"], "start": w["start"] / 1000} for w in res.get("words") or []]
+            segs, _ = align_text(res.get("text") or "", words) if words else ([], 0)
+            return {"segments": segs}, res.get("speech_model_used") or ASSEMBLYAI_MODEL
+        if res["status"] == "error":
+            raise RuntimeError(f"assemblyai: {res.get('error')}")
+    raise RuntimeError("assemblyai: transcript not ready in time")
+
+
 CF_MODEL = "@cf/openai/whisper-large-v3-turbo"
 
 
@@ -367,8 +409,8 @@ def cloudflare_transcribe(path, prompt):
 
 def stt_provider():
     p = (setting("YTKB_STT") or "groq").lower()
-    if p not in (*PROVIDERS, "cloudflare"):
-        sys.exit(f"YTKB_STT must be one of {', '.join([*PROVIDERS, 'cloudflare'])}, not {p!r}")
+    if p not in (*PROVIDERS, "cloudflare", "assemblyai"):
+        sys.exit(f"YTKB_STT must be one of {', '.join([*PROVIDERS, 'cloudflare', 'assemblyai'])}, not {p!r}")
     return p
 
 
@@ -381,6 +423,14 @@ def whisper_segments(url, info, tmp):
     run(["yt-dlp", "-f", "ba[acodec=opus][abr<=80]/ba[acodec=opus]/ba/b",
          "-o", f"{tmp}/src.%(ext)s", url])
     src = next(Path(tmp).glob("src.*"))
+    if stt_provider() == "assemblyai":
+        log(f"  downloaded {src.stat().st_size / 1e6:.0f} MB in {time.time() - t0:.0f}s; "
+            f"transcribing with AssemblyAI {ASSEMBLYAI_MODEL}")
+        t0 = time.time()
+        res, model = assemblyai_transcribe(src)
+        segs = [(sg["start"], sg["text"].strip()) for sg in res["segments"]]
+        log(f"    {len(segs)} sentences in {time.time() - t0:.0f}s")
+        return segs, f"assemblyai:{model}"
     log(f"  downloaded {src.stat().st_size / 1e6:.0f} MB in {time.time() - t0:.0f}s; splitting")
     t0 = time.time()
     # The segment list records each chunk's true start time in the source; chunk
