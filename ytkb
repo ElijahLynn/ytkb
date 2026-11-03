@@ -642,7 +642,9 @@ def expand(url, limit=None):
     """Videos in a playlist, channel or feed URL (flat: ids + titles, no downloads)."""
     if re.search(r"youtube\.com/(@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+)/?$", url):
         url = url.rstrip("/") + "/videos"  # channel root lists tabs, not videos
-    cmd = ["yt-dlp", "--flat-playlist", "-J"]
+    # --print streams one line per video as yt-dlp pages through the list, so long lists
+    # (a whole watch history) show progress instead of looking frozen.
+    cmd = ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s\t%(channel,uploader)s"]
     if limit:
         cmd += ["--playlist-end", str(limit)]
     if AUTH_URL.search(url):
@@ -653,10 +655,25 @@ def expand(url, limit=None):
                                "browser's YouTube cookies")
         log(f"  reading your YouTube login from {browser}")
         cmd += ["--cookies-from-browser", browser]
-    log(f"  listing {url}")
-    data = json.loads(run(cmd + [url]))
-    return [dict(id=e["id"], title=e.get("title"), channel=e.get("channel") or e.get("uploader"))
-            for e in data.get("entries") or [] if video_id(e.get("id") or "")]
+    log(f"  listing {url}" + (f" (latest {limit})" if limit else " (all of it; -n N for just the latest)"))
+    proc = subprocess.Popen(cmd + [url], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    items, t0 = [], time.time()
+    for line in proc.stdout:
+        vid, _, rest = line.rstrip("\n").partition("\t")
+        title, _, channel = rest.partition("\t")
+        if video_id(vid):
+            items.append(dict(id=vid, title=title, channel=None if channel == "NA" else channel))
+            if len(items) % 100 == 0:
+                print(f"\r  listed {len(items)} videos ({time.time() - t0:.0f}s)...", end="",
+                      file=sys.stderr, flush=True)
+    err = proc.stderr.read()
+    if proc.wait() != 0 and not items:
+        lines = [l for l in err.splitlines() if "ERROR" in l] or err.splitlines()[-1:]
+        raise RuntimeError(f"yt-dlp: {' '.join(lines)}")
+    if len(items) >= 100:
+        print(file=sys.stderr)
+    log(f"  listed {len(items)} videos in {time.time() - t0:.0f}s")
+    return items
 
 
 def add_history(con, url, a):
