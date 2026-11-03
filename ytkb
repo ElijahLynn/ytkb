@@ -691,11 +691,45 @@ def add_history(con, url, a):
         cmd_process(con, argparse.Namespace(n=None, sleep=5, no_summary=a.no_summary))
 
 
+def fit(text, width):
+    """Cut text to `width` terminal columns (emoji and CJK take two columns each)."""
+    import unicodedata
+    out, used = [], 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            out.append(ch); continue
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + cw > width:
+            break
+        out.append(ch); used += cw
+    return "".join(out)
+
+
+PICK_DRAFT = DB_PATH.parent / "pick-draft.json"
+
+
 def pick(items, preselected):
-    """Arrow-key multi-select over [(id, label)]. Returns the chosen ids, or None if cancelled."""
+    """Arrow-key multi-select over [(id, label)]. Returns the chosen ids, or None if cancelled.
+    Every change is saved to a draft, so a crash or a killed terminal never loses picks."""
     import curses
+    ids = {v for v, _ in items}
     sel = set(preselected)
+    try:
+        draft = set(json.loads(PICK_DRAFT.read_text())) & ids
+        if draft:
+            sel = draft
+            log(f"Restored {len(sel)} picks from your last unfinished session.")
+    except (OSError, ValueError):
+        pass
+    save = lambda: PICK_DRAFT.write_text(json.dumps(sorted(sel)))
     help_ = "↑↓ move  space toggle  a all/none  enter import  q cancel"
+    digits = len(str(len(items)))
+
+    def put(scr, y, text, attr, w):
+        try:  # never let one odd line crash the picker
+            scr.addstr(y, 0, fit(text, w - 1), attr)
+        except curses.error:
+            pass
 
     def ui(scr):
         curses.curs_set(0)
@@ -706,13 +740,11 @@ def pick(items, preselected):
             rows = max(1, h - 1)
             top = min(max(top, pos - rows + 1), pos)
             scr.erase()
-            scr.addnstr(0, 0, f" {len(sel)}/{len(items)} selected   {help_}".ljust(w - 1),
-                        w - 1, curses.A_REVERSE)
+            put(scr, 0, f" {pos + 1}/{len(items)}   {len(sel)} selected   {help_}".ljust(w), curses.A_REVERSE, w)
             for i in range(top, min(len(items), top + rows)):
                 vid, label = items[i]
-                line = f"{'[x]' if vid in sel else '[ ]'} {label}"
-                scr.addnstr(1 + i - top, 0, line, w - 1,
-                            curses.A_REVERSE if i == pos else curses.A_NORMAL)
+                put(scr, 1 + i - top, f"{i + 1:>{digits}}. {'[x]' if vid in sel else '[ ]'} {label}",
+                    curses.A_REVERSE if i == pos else curses.A_NORMAL, w)
             k = scr.getch()
             if k == 27:  # arrow keys some terminals send raw: ESC [ A / ESC O A
                 scr.nodelay(True)
@@ -728,17 +760,25 @@ def pick(items, preselected):
                 pos = max(0, pos - rows)
             elif k == curses.KEY_NPAGE:
                 pos = min(len(items) - 1, pos + rows)
+            elif k == curses.KEY_HOME:
+                pos = 0
+            elif k == curses.KEY_END:
+                pos = len(items) - 1
             elif k == ord(" "):
                 sel.symmetric_difference_update({items[pos][0]})
+                save()
                 pos = min(len(items) - 1, pos + 1)
             elif k == ord("a"):
                 sel.clear() if len(sel) == len(items) else sel.update(v for v, _ in items)
+                save()
             elif k in (10, 13, curses.KEY_ENTER):
                 return sel
             elif k == ord("q"):  # also a bare Esc
                 return None
 
-    return curses.wrapper(ui)
+    result = curses.wrapper(ui)
+    PICK_DRAFT.unlink(missing_ok=True)  # confirmed or deliberately cancelled: draft no longer needed
+    return result
 
 
 def cmd_pick(con, a):
