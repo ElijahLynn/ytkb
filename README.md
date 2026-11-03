@@ -24,12 +24,12 @@ transcript lines.
 ## How it works
 
 1. **Transcript.** If the uploader wrote captions, `ytkb` uses them (free,
-   accurate). Otherwise it downloads YouTube's small Opus audio track, splits
-   it into 20-minute chunks without re-encoding, and transcribes them with
-   Whisper on [Groq](https://console.groq.com) (`whisper-large-v3`, falling
-   back to `whisper-large-v3-turbo` when rate-limited), or on Cloudflare Workers AI
-   (`YTKB_STT=cloudflare`). No prompt is sent: with the title as a prompt,
-   large-v3 sometimes echoed it in place of ~30 s of speech.
+   accurate). Otherwise it downloads YouTube's small Opus audio track, splits it
+   into 3-minute chunks without re-encoding, and transcribes up to 8 chunks at a
+   time. Each request has a 15 s limit and is retried if it stalls, so one stuck
+   request can't hold up a whole video. Providers: Groq, DeepInfra, Cloudflare
+   Workers AI and others (`YTKB_STT`). No prompt is sent: with the title as a
+   prompt, Whisper large-v3 sometimes echoed it in place of ~30 s of speech.
 2. **Summary.** Claude (via the [Claude Code](https://claude.com/claude-code)
    CLI, so it runs on your Claude subscription) writes a summary and a list of
    the concrete techniques and claims.
@@ -119,6 +119,27 @@ ytkb triage                 # topics: YTKB_TOPICS
 ytkb process -n 20          # newest first; re-run to continue
 ```
 
+### Choosing a speech model
+
+Accuracy on 6 captioned technical talks (~9,800 words, 10 minutes each, scored
+against the uploaders' captions; lower is better):
+
+| Model (DeepInfra) | Word errors | Notes |
+|---|---|---|
+| `Qwen/Qwen3-ASR-1.7B` | **3.6%** | Most accurate. Its word timestamps start a line at each sentence |
+| `mistralai/Voxtral-Mini-3B-2507` | 3.8% | No timestamps of its own |
+| `openai/whisper-large-v3` | 5.4% | Default |
+
+Qwen3 makes about a third fewer errors than Whisper large-v3, but DeepInfra's Qwen3
+went from ~5 s to over 60 s per request on 2026-11-02, so it's opt-in for now:
+
+```bash
+echo 'YTKB_STT_MODEL=Qwen/Qwen3-ASR-1.7B' >> ~/.env
+ytkb add --redo "https://youtu.be/VIDEO_ID"   # re-transcribe a saved video
+```
+
+`--redo` keeps the old transcript until the new one has fully succeeded.
+
 ## Settings
 
 Environment variables, or lines in `~/.env` (values may be `op://` references):
@@ -126,7 +147,9 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 | Variable | Default |
 | --- | --- |
 | `YTKB_STT` | `groq` (default), `deepinfra`, `together`, `fireworks`, or `cloudflare` (turbo only) |
-| `YTKB_STT_MODEL` | override the provider's default Whisper model |
+| `YTKB_STT_MODEL` | override the provider's default model (e.g. `Qwen/Qwen3-ASR-1.7B` on DeepInfra) |
+| `YTKB_STT_TIMEOUT` | `15` seconds per transcription request before it's retried |
+| `YTKB_TIMING_MODEL` | `openai/whisper-large-v3-turbo`: word timings for text models that don't return their own |
 | `YTKB_DEEPINFRA_API_KEY` / `YTKB_TOGETHER_API_KEY` / `YTKB_FIREWORKS_API_KEY` | key for that provider |
 | `YTKB_GROQ_API_KEY` | falls back to `GROQ_API_KEY` |
 | `YTKB_CF_ACCOUNT_ID` / `YTKB_CF_API_TOKEN` | Cloudflare account id + API token with Workers AI permission |
@@ -139,6 +162,7 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 
 ## Costs
 
+- DeepInfra: about $0.03 per audio hour for Whisper large-v3 or Qwen3-ASR.
 - Groq Whisper: about $0.11 per audio hour (`large-v3`); the free tier allows
   about 2 hours of audio per hour per model, and `ytkb` waits out the limit.
 - Claude: one summary per video plus two calls per `ask`, on your Claude plan.

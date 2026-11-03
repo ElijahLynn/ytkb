@@ -32,6 +32,7 @@ settings (env or ~/.env; values may be op:// 1Password references):
 """
 
 import argparse
+import difflib
 import base64
 import fcntl
 import json
@@ -57,6 +58,10 @@ TOPICS = os.environ.get(
 PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1/audio/transcriptions", "whisper-large-v3",
              ("YTKB_GROQ_API_KEY", "GROQ_API_KEY"), "whisper-large-v3-turbo"),
+    # Default whisper-large-v3. Qwen/Qwen3-ASR-1.7B (YTKB_STT_MODEL) made ~1/3 fewer word
+    # errors on 6 captioned tech talks (3.6% vs 5.4%) and its word timestamps start a line
+    # at each sentence, but DeepInfra's Qwen3 went from ~5 s to >60 s per request on
+    # 2026-11-02, so it's opt-in until it's reliable.
     "deepinfra": ("https://api.deepinfra.com/v1/audio/transcriptions", "openai/whisper-large-v3",
                   ("YTKB_DEEPINFRA_API_KEY", "DEEPINFRA_API_KEY"), None),
     "together": ("https://api.together.ai/v1/audio/transcriptions", "openai/whisper-large-v3",
@@ -67,9 +72,14 @@ PROVIDERS = {
 GROQ_MODEL = os.environ.get("YTKB_GROQ_MODEL", "whisper-large-v3")
 GROQ_FALLBACK = os.environ.get("YTKB_GROQ_FALLBACK", "whisper-large-v3-turbo")
 CLAUDE_MODEL = os.environ.get("YTKB_CLAUDE_MODEL", "sonnet")
-# 20 min ≈ 3.6 MB at 24 kbps Opus: well under Groq's 25 MB cap, and small enough to
-# fit into a partly used rate-limit window.
-SEGMENT_SECONDS = 1200
+# 3-min chunks, all sent at once: each request answers in ~5-8 s, well inside STT_TIMEOUT
+# (10-min chunks sometimes ran past it), and a long talk takes about one chunk's time.
+SEGMENT_SECONDS = 180
+# Per-request limit: a stuck request (one DeepInfra call once hung 20 min) is cut off
+# and retried instead of stalling the whole ingest.
+STT_TIMEOUT = float(os.environ.get("YTKB_STT_TIMEOUT", "15"))
+# Backup word-timestamp model, for text models that don't return word timestamps.
+TIMING_MODEL = os.environ.get("YTKB_TIMING_MODEL", "openai/whisper-large-v3-turbo")
 # Free mode: when a video has no uploader captions, use YouTube's auto-captions
 # (free, no rate limit, lower accuracy) instead of Groq Whisper.
 FREE = False
@@ -236,13 +246,17 @@ def provider_key(provider):
     return secret(*names) or sys.exit(f"{provider} needs {' or '.join(names)} (env or ~/.env)")
 
 
-def groq_transcribe(path, prompt, key, provider="groq"):
+def groq_transcribe(path, prompt, key, provider="groq", model=None, words=False):
     """OpenAI-compatible /audio/transcriptions. Returns (response, model). On a 429 we try
-    the provider's fallback model (Groq only) before waiting for the limit to reset."""
+    the provider's fallback model (Groq only) before waiting for the limit to reset.
+    model: use exactly this model (no fallback). words: also return word timestamps."""
     url, model0, _, fallback = PROVIDERS[provider]
     if provider == "groq":
         model0, fallback = GROQ_MODEL, GROQ_FALLBACK
-    model0 = setting("YTKB_STT_MODEL") or model0
+    if model:
+        model0, fallback = model, None
+    else:
+        model0 = setting("YTKB_STT_MODEL") or model0
     models = [model0] + ([fallback] if fallback and fallback != model0 else [])
     hdr, limited, errors = Path(f"{path}.hdr"), {}, 0
     while True:
@@ -254,10 +268,12 @@ def groq_transcribe(path, prompt, key, provider="groq"):
             continue
         # The auth header goes in via a stdin config so the key never shows in `ps`.
         r = subprocess.run(
-            ["curl", "-sS", "-K", "-", "-D", str(hdr), url,
+            ["curl", "-sS", "-K", "-", "-D", str(hdr), "--max-time", str(STT_TIMEOUT), url,
              # model before file: some providers stream the upload and need it first
              "-F", f"model={model}", "-F", "response_format=verbose_json",
-             "-F", "timestamp_granularities[]=segment", "-F", f"file=@{path}",
+             "-F", "timestamp_granularities[]=segment",
+             *(["-F", "timestamp_granularities[]=word"] if words else []),
+             "-F", f"file=@{path}",
              *(["--form-string", f"prompt={prompt}"] if prompt else []), "-w", "\n%{http_code}"],
             input=f'header = "Authorization: Bearer {key}"\n', capture_output=True, text=True,
         )
@@ -272,11 +288,46 @@ def groq_transcribe(path, prompt, key, provider="groq"):
             log(f"  {model} rate-limited for {ts(wait)}")
             continue
         errors += 1
-        if code in ("500", "502", "503") and errors < 6:
-            log(f"  {provider} {code}, retrying in {30 * errors}s")
-            time.sleep(30 * errors)
+        if r.returncode == 28 and errors < 4:  # curl: --max-time exceeded
+            log(f"  {provider} {model.rsplit('/', 1)[-1]}: no answer in {STT_TIMEOUT:.0f}s, retrying")
+            time.sleep(1)
             continue
-        raise RuntimeError(f"{provider} {code}: {body[:300]} {r.stderr[:300]}")
+        if code in ("500", "502", "503", "504") and errors < 4:
+            log(f"  {provider} {code}, retrying in {5 * errors}s")
+            time.sleep(5 * errors)
+            continue
+        raise RuntimeError(f"{provider} {code or 'timeout'}: {body[:300]} {r.stderr[:300]}")
+
+
+def align_text(text, wwords):
+    """Hybrid transcription: give each sentence of `text` (from the more accurate model)
+    the start time of its first word, using another model's word timestamps. Words that
+    don't match get times interpolated from matched neighbours. Returns (segments, share
+    of words matched)."""
+    tok = lambda w: re.sub(r"[^a-z0-9]", "", w.lower())
+    sents = [x.strip() for x in re.split(r"(?<=[.!?])\s+", text) if x.strip()]
+    vwords, sent_of = [], []
+    for si, sent in enumerate(sents):
+        for w in sent.split():
+            vwords.append(tok(w)); sent_of.append(si)
+    times = [None] * len(vwords)
+    for b in difflib.SequenceMatcher(None, vwords, [tok(w["word"]) for w in wwords],
+                                     autojunk=False).get_matching_blocks():
+        for k in range(b.size):
+            times[b.a + k] = float(wwords[b.b + k]["start"])
+    known = [i for i, t in enumerate(times) if t is not None]
+    for i, t in enumerate(times):
+        if t is None and known:
+            prev = max((k for k in known if k < i), default=None)
+            nxt = min((k for k in known if k > i), default=None)
+            times[i] = (times[nxt] if prev is None else times[prev] if nxt is None else
+                        times[prev] + (times[nxt] - times[prev]) * (i - prev) / (nxt - prev))
+    segs, seen = [], set()
+    for i, si in enumerate(sent_of):
+        if si not in seen:
+            seen.add(si)
+            segs.append({"start": times[i] or 0.0, "text": sents[si]})
+    return segs, len(known) / max(1, len(vwords))
 
 
 CF_MODEL = "@cf/openai/whisper-large-v3-turbo"
@@ -361,12 +412,33 @@ def whisper_segments(url, info, tmp):
     log(f"  transcribing {len(parts)} part(s) in parallel with {provider}")
     t0 = time.time()
 
-    def one(part):
-        return (cloudflare_transcribe(part, prompt) if provider == "cloudflare"
-                else groq_transcribe(part, prompt, key, provider))
-
-    # All chunks at once: a long talk takes about as long as its slowest 20-min chunk.
     from concurrent.futures import ThreadPoolExecutor
+    text_model = (setting("YTKB_STT_MODEL") or PROVIDERS.get(provider, ("", ""))[1]
+                  if provider != "groq" else GROQ_MODEL)
+    # Non-Whisper models (Qwen3) return long segments; ask for word timestamps and start a
+    # line at each sentence instead, so timestamp links land on the sentence.
+    sentence_lines = provider not in ("groq", "cloudflare") and "whisper" not in text_model.lower()
+    words_of = lambda r: r.get("words") or [w for seg in r.get("segments", []) for w in (seg.get("words") or [])]
+
+    def one(part):
+        if provider == "cloudflare":
+            return cloudflare_transcribe(part, prompt)
+        if not sentence_lines:
+            return groq_transcribe(part, prompt, key, provider)
+        res, model = groq_transcribe(part, "", key, provider, text_model, words=True)
+        wwords, label = words_of(res), model.rsplit("/", 1)[-1]
+        if not wwords:  # this model has no word timestamps: borrow a Whisper pass's
+            wres, wmodel = groq_transcribe(part, "", key, provider, TIMING_MODEL, words=True)
+            wwords, label = words_of(wres), f"{label} text + {wmodel.rsplit('/', 1)[-1]} timing"
+        if not wwords:
+            return res, model
+        segs, matched = align_text(res.get("text", ""), wwords)
+        if matched < 0.8:
+            log(f"    {part.name}: only {matched:.0%} of words lined up; timestamps approximate")
+        return {"segments": segs}, label
+
+    # All chunks at once: a long talk takes about as long as its slowest chunk.
+    # At most 8 at once: 26 simultaneous requests made DeepInfra slow even for Whisper.
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(one, parts))
     segs, used = [], set()
@@ -402,8 +474,8 @@ def ingest(con, url_or_id, with_summary=True, redo=False):
     if not vid:
         raise ValueError(f"not a YouTube URL: {url_or_id}")
     if redo and con.execute("select 1 from videos where id=?", (vid,)).fetchone():
-        log(f"~ {vid}: re-transcribing (--redo)")
-        forget(con, vid)
+        log(f"~ {vid}: re-transcribing (--redo); the old transcript stays until this succeeds")
+        return _ingest(con, vid, with_summary, replace=True)
     if con.execute("select 1 from videos where id=?", (vid,)).fetchone():
         log(f"= {vid} already ingested; skipping")
         return vid
@@ -423,7 +495,7 @@ def ingest(con, url_or_id, with_summary=True, redo=False):
         return _ingest(con, vid, with_summary)
 
 
-def _ingest(con, vid, with_summary):
+def _ingest(con, vid, with_summary, replace=False):
     url = f"https://www.youtube.com/watch?v={vid}"
     log(f"> {vid}: fetching metadata")
     info = json.loads(run(["yt-dlp", "-J", "--skip-download", "--no-playlist", url]))
@@ -452,7 +524,10 @@ def _ingest(con, vid, with_summary):
                upload_date=info.get("upload_date"), duration=info.get("duration"),
                description=info.get("description"), transcript=transcript,
                transcript_source=source, summary=summary)
-    with con:
+    with con:  # one transaction: a --redo swaps old for new, or leaves the old in place
+        if replace:
+            for table, col in (("videos", "id"), ("videos_fts", "id"), ("segments_fts", "video_id")):
+                con.execute(f"delete from {table} where {col}=?", (vid,))
         con.execute(f"insert into videos({','.join(row)}) values({','.join('?' * len(row))})",
                     list(row.values()))
         con.execute("insert into videos_fts values(?,?,?,?,?)",
