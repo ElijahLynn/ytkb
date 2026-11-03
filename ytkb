@@ -845,7 +845,7 @@ def cmd_pick(con, a):
         if answer.startswith("n"):
             log("Saved. Run `ytkb process` when you're ready.")
             return
-    cmd_process(con, argparse.Namespace(n=None, sleep=getattr(a, "sleep", 5), jobs=3,
+    cmd_process(con, argparse.Namespace(n=None, sleep=getattr(a, "sleep", 5), jobs=None,
                                         no_summary=getattr(a, "no_summary", False)))
 
 
@@ -954,7 +954,7 @@ def cmd_triage(con, a):
 def cmd_process(con, a):
     rows = con.execute(f"select id from queue where status='relevant' order by {QUEUE_ORDER} "
                        + (f"limit {int(a.n)}" if a.n else "")).fetchall()
-    jobs = max(1, getattr(a, "jobs", 3) or 3)
+    jobs = max(1, getattr(a, "jobs", None) or int(setting("YTKB_JOBS") or 5))
     total = len(rows)
     if not total:
         log("Nothing selected to process.")
@@ -1179,7 +1179,8 @@ def main():
     cmd("triage", "have Claude mark queued videos relevant/skip by title (YTKB_TOPICS)")
     s = cmd("process", "ingest queued videos marked relevant, newest first")
     s.add_argument("-n", type=int, help="at most N videos")
-    s.add_argument("-j", "--jobs", type=int, default=3, help="videos at a time (default 3)")
+    s.add_argument("-j", "--jobs", type=int, help="videos at a time (default 5, or YTKB_JOBS; "
+                   "AssemblyAI's free tier runs 5 jobs at once)")
     s.add_argument("--sleep", type=float, default=5, help="seconds between videos (default 5)")
     s.add_argument("--no-summary", action="store_true", help="skip Claude summaries")
     s = cmd("ask", "answer a question from the knowledge base, with timestamp links")

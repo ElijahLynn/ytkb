@@ -157,6 +157,7 @@ Environment variables, or lines in `~/.env` (values may be `op://` references):
 | `YTKB_ASSEMBLYAI_API_KEY` | AssemblyAI key ([https://www.assemblyai.com/dashboard/api-keys](https://www.assemblyai.com/dashboard/api-keys); $50 free credit) |
 | `YTKB_ASSEMBLYAI_MODEL` | `universal-3-5-pro` |
 | `YTKB_STT_MODEL` | override the provider's default model (e.g. `Qwen/Qwen3-ASR-1.7B` on DeepInfra) |
+| `YTKB_JOBS` | `5` videos transcribed at a time (AssemblyAI's free tier runs 5 jobs at once; more can trigger YouTube throttling) |
 | `YTKB_STT_TIMEOUT` | `15` seconds per transcription request before it's retried |
 | `YTKB_TIMING_MODEL` | `openai/whisper-large-v3-turbo`: word timings for text models that don't return their own |
 | `YTKB_DEEPINFRA_API_KEY` / `YTKB_TOGETHER_API_KEY` / `YTKB_FIREWORKS_API_KEY` | key for that provider |
